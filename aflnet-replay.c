@@ -20,6 +20,12 @@ Optional:
 int main(int argc, char* argv[])
 {
   FILE *fp;
+  // The response-code extraction below maps every raw message code through
+  // message_code_map, which is only allocated by init_message_code_map().
+  // Without this call the first kh_get() dereferences a NULL hash table and
+  // segfaults (afl-fuzz.c calls it in main; this standalone replay tool did
+  // not).
+  init_message_code_map();
   int portno, n;
   struct sockaddr_in serv_addr;
   char* buf = NULL, *response_buf = NULL;
