@@ -2562,7 +2562,7 @@ static unsigned int resp_walk_reply(unsigned char* buf, unsigned int buf_size, u
           if ((i + 1 >= buf_size) || (buf[i + 1] != 0x0A)) return 0;
           if ((i - off == 3) && !memcmp(buf + off + 1, "OK", 2)) code = 100;
           else if ((i - off == 5) && !memcmp(buf + off + 1, "PONG", 4)) code = 101;
-          else if ((i - off == 8) && !memcmp(buf + off + 1, "QUEUED", 6)) code = 102;
+          else if ((i - off == 7) && !memcmp(buf + off + 1, "QUEUED", 6)) code = 102;
           resp_append_code(code, state_sequence_ref, state_count_ref);
           return i + 2;
         }
@@ -2577,8 +2577,13 @@ static unsigned int resp_walk_reply(unsigned char* buf, unsigned int buf_size, u
       for (i = off + 1; i < buf_size; i++) {
         if (buf[i] == 0x0D) {
           unsigned int wlen;
+          unsigned int wend;
           if ((i + 1 >= buf_size) || (buf[i + 1] != 0x0A)) return 0;
-          wlen = i - (off + 1);
+          // the keyword is the first word only -- error messages usually
+          // carry free text after it (e.g. "-ERR unknown command 'x'")
+          wend = off + 1;
+          while ((wend < i) && (buf[wend] != ' ')) wend++;
+          wlen = wend - (off + 1);
           if ((wlen == 3) && !memcmp(buf + off + 1, "ERR", 3)) code = 200;
           else if ((wlen == 9) && !memcmp(buf + off + 1, "WRONGTYPE", 9)) code = 201;
           else if ((wlen == 6) && !memcmp(buf + off + 1, "NOAUTH", 6)) code = 202;
