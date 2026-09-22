@@ -11,6 +11,37 @@
 #include "alloc-inl.h"
 #include "aflnet.h"
 
+// Mapping from original state IDs to compact IDs starting from 1
+
+static u32 message_code_counter = 0;
+khash_t(32) *message_code_map = NULL;
+
+void init_message_code_map(){
+  message_code_map = kh_init(32);
+}
+
+void destroy_message_code_map(){
+  kh_destroy(32, message_code_map);
+}
+
+u32 get_mapped_message_code (u32 ori_message_code){
+  u32 mapped_message_code = 0;
+  khiter_t k = kh_get(32, message_code_map, ori_message_code);
+  if (k == kh_end(message_code_map)) {
+    int ret;
+    k = kh_put(32, message_code_map, ori_message_code, &ret);
+    message_code_counter++;
+    kh_value(message_code_map, k) = message_code_counter;
+
+    mapped_message_code = message_code_counter;
+  }
+  else {
+    mapped_message_code = kh_value(message_code_map, k);
+  }
+
+  return mapped_message_code;
+}
+
 // Protocol-specific functions for extracting requests and responses
 
 region_t* extract_requests_tftp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
@@ -960,6 +991,63 @@ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsign
   return regions;
 }
 
+region_t* extract_requests_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  char *mem;
+  unsigned int mem_count = 0;
+  unsigned int mem_size = 1024;
+  unsigned int region_count = 0;
+  unsigned int cur_start = 0;
+  unsigned int cur_end = 0;
+  region_t *regions = NULL;
+  mem=(char *)ck_alloc(mem_size);
+  while(cur_start < buf_size)
+  {
+		if ((buf_size - cur_start) == 1) {
+			region_count++;
+			regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+			regions[region_count - 1].start_byte = cur_start;
+			regions[region_count - 1].end_byte = buf_size - 1;
+			regions[region_count - 1].state_sequence = NULL;
+			regions[region_count - 1].state_count = 0;	
+			break;	
+		}
+    // Read the packet header
+    memcpy(&mem[mem_count], buf + cur_start, 2);
+    cur_start = cur_start + 2;
+    // Check the packet length and update current_end
+    // mem[0] is Message Type. mem[1] is Msg Len.
+    if(mem[1] >= 0) 
+      cur_end = cur_start + mem[1] - 1;
+    else
+      cur_end = buf_size;
+    // Create a region for every request
+		region_count++;
+		regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+		regions[region_count - 1].start_byte = cur_start - 2;
+		regions[region_count - 1].end_byte = cur_end;
+		regions[region_count - 1].state_sequence = NULL;
+		regions[region_count - 1].state_count = 0;
+    // Update the indices
+    mem_count = 0;
+    cur_start = cur_end + 1;
+    cur_end = cur_start;
+  }
+  if(mem) ck_free(mem);
+  //in case region_count equals zero, it means that the structure of the buffer is broken
+  //hence we create one region for the whole buffer
+	if ((region_count == 0) && (buf_size > 0)) {
+		regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+		regions[0].start_byte = 0;
+		regions[0].end_byte = buf_size - 1;
+		regions[0].state_sequence = NULL;
+		regions[0].state_count = 0;
+		region_count = 1;
+	}
+	*region_count_ref = region_count;
+	return regions;
+}
+
 region_t* extract_requests_sip(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
 {
   char *mem;
@@ -1207,6 +1295,8 @@ unsigned int* extract_response_codes_tftp(unsigned char* buf, unsigned int buf_s
 
       if (message_code == 0) break;
 
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1217,6 +1307,9 @@ unsigned int* extract_response_codes_tftp(unsigned char* buf, unsigned int buf_s
       temp[4] = 0x0;
       unsigned int message_code = (unsigned int) atoi(temp);
       if (message_code == 0) break;
+
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1268,6 +1361,8 @@ unsigned int* extract_response_codes_dhcp(unsigned char* buf, unsigned int buf_s
 
       if (message_code == 0) break;
 
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1278,6 +1373,9 @@ unsigned int* extract_response_codes_dhcp(unsigned char* buf, unsigned int buf_s
       temp[4] = 0x0;
       unsigned int message_code = (unsigned int) atoi(temp);
       if (message_code == 0) break;
+
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1333,6 +1431,8 @@ unsigned int* extract_response_codes_SNTP(unsigned char* buf, unsigned int buf_s
 
       } 
 
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1345,6 +1445,9 @@ unsigned int* extract_response_codes_SNTP(unsigned char* buf, unsigned int buf_s
       if (message_code == 0) {
         break;
       }
+
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1397,7 +1500,9 @@ unsigned int* extract_response_codes_NTP(unsigned char* buf, unsigned int buf_si
       {
         break;
 
-      } 
+      }
+      
+      message_code = get_mapped_message_code(message_code);
 
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -1411,6 +1516,9 @@ unsigned int* extract_response_codes_NTP(unsigned char* buf, unsigned int buf_si
       if (message_code == 0) {
         break;
       }
+
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1471,6 +1579,8 @@ unsigned int* extract_response_codes_SNMP(unsigned char* buf, unsigned int buf_s
 
       } 
 
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1483,6 +1593,9 @@ unsigned int* extract_response_codes_SNMP(unsigned char* buf, unsigned int buf_s
       if (message_code == 0) {
         break;
       }
+
+      message_code = get_mapped_message_code(message_code);
+
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1528,6 +1641,8 @@ unsigned int* extract_response_codes_smtp(unsigned char* buf, unsigned int buf_s
       unsigned int message_code = (unsigned int) atoi(temp);
 
       if (message_code == 0) break;
+
+      message_code = get_mapped_message_code(message_code);
 
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -1586,16 +1701,21 @@ unsigned int* extract_response_codes_ssh(unsigned char* buf, unsigned int buf_si
         if (message_size - 2 > buf_size - byte_count) break;
 
         unsigned char message_code = (unsigned char)mem[5];
-        state_count++;
-        state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
-        if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
-        state_sequence[state_count - 1] = message_code;
+        
         /* If this is a KEY exchange related message */
         if ((message_code >= 20) && (message_code <= 49)) {
           //Do nothing
         } else {
           message_size += 8;
         }
+
+        message_code = get_mapped_message_code(message_code);
+
+        state_count++;
+        state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+        if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
+        state_sequence[state_count - 1] = message_code;
+
         byte_count += message_size - 2;
       }
    }
@@ -1656,6 +1776,7 @@ unsigned int* extract_response_codes_tls(unsigned char* buf, unsigned int buf_si
 
       //add a new response code
       unsigned int message_code = (content_type << 8) + message_type;
+      message_code = get_mapped_message_code(message_code);
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = message_code;
@@ -1692,6 +1813,7 @@ unsigned int* extract_response_codes_dicom(unsigned char* buf, unsigned int buf_
 
   state_count++;
   unsigned int message_code = buf[0]; // return PDU type as status code
+  message_code = get_mapped_message_code(message_code);
   state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
   state_sequence[state_count - 1] = message_code;
 
@@ -1724,6 +1846,7 @@ unsigned int* extract_response_codes_dns(unsigned char* buf, unsigned int buf_si
 
       // Save the 3rd & 4th bytes as the response code
       unsigned int message_code = (unsigned int) ((mem[2] << 8) + mem[3]);
+      message_code = get_mapped_message_code(message_code);
 
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -1921,6 +2044,8 @@ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf
       }
 
       status_code = (content_type << 8) + message_type;
+
+      status_code = get_mapped_message_code(status_code);
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = status_code;
@@ -1966,6 +2091,8 @@ unsigned int* extract_response_codes_rtsp(unsigned char* buf, unsigned int buf_s
 
         if (message_code == 0) break;
 
+        message_code = get_mapped_message_code(message_code);
+
         state_count++;
         state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
         state_sequence[state_count - 1] = message_code;
@@ -2005,8 +2132,8 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
 
   while (byte_count < buf_size) {
     memcpy(&mem[mem_count], buf + byte_count++, 1);
-
-    if ((mem_count > 0) && (memcmp(&mem[mem_count - 1], terminator, 2) == 0)) {
+    if ((mem_count > 0) && (memcmp(&mem[mem_count - 1], terminator, 2) == 0) && ((mem[3]==' ') || (isdigit(buf[byte_count]) && (memcmp(&mem[0], &buf[byte_count], 3))!=0) || byte_count == buf_size)) {
+    // if ((mem_count > 0) && (memcmp(&mem[mem_count - 1], terminator, 2) == 0)) {
       //Extract the response code which is the first 3 bytes
       char temp[4];
       memcpy(temp, mem, 4);
@@ -2014,6 +2141,8 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
       unsigned int message_code = (unsigned int) atoi(temp);
 
       if (message_code == 0) break;
+
+      message_code = get_mapped_message_code(message_code);
 
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -2031,6 +2160,71 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
   if (mem) ck_free(mem);
   *state_count_ref = state_count;
   return state_sequence;
+}
+
+unsigned int* extract_response_codes_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  unsigned char *mem;
+	unsigned int byte_count = 0;
+	unsigned int mem_count = 0;
+	unsigned int mem_size = 1024;
+	unsigned int *state_sequence = NULL;
+	unsigned int state_count = 0;
+  // Packet headers for MQTT broker responses
+	char start1[1]={0x20}; // Connect Ack
+	char start2[1]={0x40}; // Publish Ack
+  char start3[1]={0x50}; // Publish Receive
+  char start4[1]={0x62}; // Publish Release
+  char start5[1]={0x70}; // Publish complete
+	char start6[1]={0x90}; // Subscribe Ack
+  char start7[1]={0xB0}; // Unsubscribe Ack
+  char start8[1]={0xD0}; // Ping Response
+  char start9[1]={0xE0}; // Disconnect
+  char start10[1]={0xF0}; // Auth
+	mem=(unsigned char *)ck_alloc(mem_size);
+	// Initial state of the response state machine
+	state_count++;
+	state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+	state_sequence[state_count - 1] = 0;
+  while(byte_count < buf_size)
+  {
+    // Copy the packet header to get the message type(mem[0])
+		memcpy(&mem[mem_count++], buf + byte_count++, 1);
+		memcpy(&mem[mem_count], buf + byte_count++, 1);
+    // printf("[fuzz]mem[0] is %02x\n",mem[0]);
+    // printf("[fuzz]mem[1] is %02x\n",mem[1]);
+    // Determine whether it's a response packet
+    if ((mem_count > 0) && ((memcmp(&mem[0], start1, 1) == 0) || (memcmp(&mem[0], start2, 1) == 0) || (memcmp(&mem[0], start3, 1) == 0) || (memcmp(&mem[0], start4, 1) == 0) || (memcmp(&mem[0], start5, 1) == 0) || (memcmp(&mem[0], start6, 1) == 0) || (memcmp(&mem[0], start7, 1) == 0) || (memcmp(&mem[0], start8, 1) == 0) || (memcmp(&mem[0], start9, 1) == 0) || (memcmp(&mem[0], start10, 1) == 0)))
+    {
+      // Get the response code(message type) from the packet
+      unsigned char message_code = (unsigned char)mem[0];
+      // printf("[fuzz]message_code is %02x\n",message_code);
+			if (message_code == 0) break;
+
+      message_code = get_mapped_message_code(message_code);
+
+      // Create a new state 
+			state_count++;
+			state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+			state_sequence[state_count - 1] = message_code;
+			mem_count = 0;
+      // yk
+			byte_count = byte_count + mem[1];
+    }
+    else
+    {
+      mem_count++;
+      if(mem_count == mem_size)
+      {
+        //enlarge the mem buffer
+        mem_size = mem_size * 2;
+        mem=(char *)ck_realloc(mem, mem_size); 
+      }
+    }
+  }
+	if (mem) ck_free(mem);
+	*state_count_ref = state_count;
+	return state_sequence;
 }
 
 unsigned int* extract_response_codes_sip(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
@@ -2063,6 +2257,8 @@ unsigned int* extract_response_codes_sip(unsigned char* buf, unsigned int buf_si
         unsigned int message_code = (unsigned int) atoi(temp);
 
         if (message_code == 0) break;
+
+        message_code = get_mapped_message_code(message_code);
 
         state_count++;
         state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -2115,6 +2311,8 @@ unsigned int* extract_response_codes_http(unsigned char* buf, unsigned int buf_s
         unsigned int message_code = (unsigned int) atoi(temp);
 
         if (message_code == 0) break;
+
+        message_code = get_mapped_message_code(message_code);
 
         state_count++;
         state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -2178,6 +2376,8 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
           //200 + IPP code to not confuse initial 0 state with successful-ok 0 state
           message_code += (unsigned int) (10 * third + fourth);
         }
+
+        message_code = get_mapped_message_code(message_code);
 
         state_count++;
         state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -2504,6 +2704,7 @@ int parse_net_config(u8* net_config, u8* protocol, u8** ip_address, u32* port)
       *port = atoi(tokens[2]);
       if (*port == 0) return 1;
   } else return 1;
+  free(tokens);
   return 0;
 }
 
