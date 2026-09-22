@@ -63,6 +63,7 @@ int main(int argc, char* argv[])
   else if (!strcmp(argv[2], "NTP")) extract_response_codes = &extract_response_codes_NTP;
   else if (!strcmp(argv[2], "DHCP")) extract_response_codes = &extract_response_codes_dhcp;
   else if (!strcmp(argv[2], "SNTP")) extract_response_codes = &extract_response_codes_SNTP;  
+  else if (!strcmp(argv[2], "RESP")) extract_response_codes = &extract_response_codes_resp;
 else {fprintf(stderr, "[AFLNet-replay] Protocol %s has not been supported yet!\n", argv[2]); exit(1);}
 
   portno = atoi(argv[3]);
