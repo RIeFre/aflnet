@@ -45,13 +45,24 @@ int main(int argc, char* argv[])
     fprintf(stderr, "[AFLNet-replay] Error opening file %s\n", argv[1]); 
     exit(1);
   }
+  else if (!strcmp(argv[2], "RDP")) extract_response_codes = &extract_response_codes_rdp;
+  else if (!strcmp(argv[2], "RADIUS")) extract_response_codes = &extract_response_codes_radius;
+  else if (!strcmp(argv[2], "PGSQL")) extract_response_codes = &extract_response_codes_pgsql;
+  else if (!strcmp(argv[2], "SNMP")) extract_response_codes = &extract_response_codes_snmp;
+  else if (!strcmp(argv[2], "BGP")) extract_response_codes = &extract_response_codes_bgp;
+  else if (!strcmp(argv[2], "HTTP2")) extract_response_codes = &extract_response_codes_http2;
   
+  else if (!strcmp(argv[2], "COAP")) extract_response_codes = &extract_response_codes_coap;
+  else if (!strcmp(argv[2], "CHRONY")) extract_response_codes = &extract_response_codes_chrony;
+  else if (!strcmp(argv[2], "CHRONYC")) extract_response_codes = &extract_response_codes_chronyc;
   if (!strcmp(argv[2], "RTSP")) extract_response_codes = &extract_response_codes_rtsp;
   else if (!strcmp(argv[2], "FTP")) extract_response_codes = &extract_response_codes_ftp;
   else if (!strcmp(argv[2], "MQTT")) extract_response_codes = &extract_response_codes_mqtt;
   else if (!strcmp(argv[2], "DNS")) extract_response_codes = &extract_response_codes_dns;
   else if (!strcmp(argv[2], "DTLS12")) extract_response_codes = &extract_response_codes_dtls12;
+  else if (!strcmp(argv[2], "IMAP")) extract_response_codes = &extract_response_codes_imap;
   else if (!strcmp(argv[2], "DICOM")) extract_response_codes = &extract_response_codes_dicom;
+  else if (!strcmp(argv[2], "MEMCACHED")) extract_response_codes = &extract_response_codes_memcached;
   else if (!strcmp(argv[2], "SMTP")) extract_response_codes = &extract_response_codes_smtp;
   else if (!strcmp(argv[2], "SSH")) extract_response_codes = &extract_response_codes_ssh;
   else if (!strcmp(argv[2], "TLS")) extract_response_codes = &extract_response_codes_tls;
@@ -85,7 +96,7 @@ else {fprintf(stderr, "[AFLNet-replay] Protocol %s has not been supported yet!\n
   }
 
   int sockfd;
-  if ((!strcmp(argv[2], "DTLS12")) || (!strcmp(argv[2], "DNS")) || (!strcmp(argv[2], "SIP"))) {
+  if ((!strcmp(argv[2], "DTLS12")) || (!strcmp(argv[2], "DNS")) || (!strcmp(argv[2], "SIP")) || (!strcmp(argv[2], "DHCP")) || (!strcmp(argv[2], "CHRONY")) || (!strcmp(argv[2], "CHRONYC")) || (!strcmp(argv[2], "SNMP")) || (!strcmp(argv[2], "RADIUS"))) {
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   } else {
     sockfd = socket(AF_INET, SOCK_STREAM, 0);

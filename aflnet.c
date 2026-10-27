@@ -113,67 +113,50 @@ region_t* extract_requests_tftp(unsigned char* buf, unsigned int buf_size, unsig
 
 
 
+// DHCP over UDP: the 236-byte BOOTP header, the magic cookie 63 82 53 63,
+// then options (0 = pad, 255 = end, other codes: code, length, value). A
+// message ends after its END option and the zero padding that follows it
+// (BOOTP pads messages to 300 bytes). Returns the message length, or 0 when
+// the framing does not parse; *type_ref receives the value of option 53
+// (DHCP message type), 0 when absent.
+static unsigned int dhcp_message_len(const unsigned char* b, unsigned int rem, unsigned int* type_ref)
+{
+  unsigned int p = 240;
+  *type_ref = 0;
+  if (rem < 241 || b[236] != 0x63 || b[237] != 0x82 || b[238] != 0x53 || b[239] != 0x63) return 0;
+  while (p < rem) {
+    if (b[p] == 0) { p++; continue; }
+    if (b[p] == 255) {
+      p++;
+      while (p < rem && b[p] == 0) p++;
+      return p;
+    }
+    if (p + 1 >= rem || b[p + 1] > rem - p - 2) return 0;
+    if (b[p] == 53 && b[p + 1] >= 1 && !*type_ref) *type_ref = b[p + 2];
+    p += 2 + b[p + 1];
+  }
+  return 0; // no END option
+}
+
 region_t* extract_requests_dhcp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
 {
-  char *mem;
-  unsigned int mem_count = 0;
-  unsigned int mem_size = 1024;
-  unsigned int region_count = 0;
+  // One region per message (one datagram each); a tail that does not parse
+  // becomes one final region.
   region_t *regions = NULL;
-  char terminator[2] = {0xff, 0xff};
-  //char* terminator = '\0';
-  mem = (char *)ck_alloc(mem_size);
+  unsigned int region_count = 0, i = 0;
 
-  unsigned int cur_start = 0;
-  unsigned int cur_end = 0;
-  for (unsigned int byte_count = 0; byte_count < buf_size; byte_count++) {
-    memcpy(&mem[mem_count], buf + byte_count, 1);
-    if ((mem_count > 1) && (memcmp(&mem[mem_count - 1], terminator, 2) == 0)){
-        region_count++;
-        regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
-        regions[region_count - 1].start_byte = cur_start;
-        regions[region_count - 1].end_byte = cur_end;
-        regions[region_count - 1].state_sequence = NULL;
-        regions[region_count - 1].state_count = 0;
-
-        mem_count = 0;
-        cur_start = cur_end + 1;
-        cur_end = cur_start;
-
-    }
-    else {
-      mem_count++;
-      cur_end++;
-      //Check if the last byte has been reached
-      if (cur_end == buf_size - 1) {
-        region_count++;
-        regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
-        regions[region_count - 1].start_byte = cur_start;
-        regions[region_count - 1].end_byte = cur_end;
-        regions[region_count - 1].state_sequence = NULL;
-        regions[region_count - 1].state_count = 0;
-        break;
-      }
-      if (mem_count == mem_size) {
-
-        //enlarge the mem buffer
-        mem_size = mem_size * 2;
-        mem=(char *)ck_realloc(mem, mem_size);
-      }
-    }
-    //ACTF("End of iteration");
-  }
-  if (mem) ck_free(mem);
-  //in case region_count equals zero, it means that the structure of the buffer is broken
-  //hence we create one region for the whole buffer
-  if ((region_count == 0) && (buf_size > 0)) {
-    regions = (region_t *)ck_realloc(regions, sizeof(region_t));
-    regions[0].start_byte = 0;
-    regions[0].end_byte = buf_size - 1;
-    regions[0].state_sequence = NULL;
-    regions[0].state_count = 0;
-
-    region_count = 1;
+  while (i < buf_size) {
+    unsigned int type, mlen = dhcp_message_len(buf + i, buf_size - i, &type);
+    int framed = (mlen != 0);
+    if (!framed) mlen = buf_size - i;
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + mlen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += mlen;
+    if (!framed) break;
   }
 
   *region_count_ref = region_count;
@@ -991,61 +974,49 @@ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsign
   return regions;
 }
 
+// MQTT control packet: one type/flags byte, the Remaining Length as a
+// variable byte integer (1-4 bytes, 7 bits each, top bit = more), then that
+// many bytes. Returns the packet length, or 0 when the buffer does not hold
+// a complete, well-formed packet; *hdrlen receives the fixed header length.
+static unsigned int mqtt_packet_len(const unsigned char* b, unsigned int rem, unsigned int* hdrlen)
+{
+  unsigned int value = 0, shift = 0, k;
+  for (k = 1; k <= 4; k++) {
+    if (k >= rem) return 0;
+    value |= (unsigned int)(b[k] & 0x7f) << shift;
+    if (!(b[k] & 0x80)) {
+      if (value > rem - 1 - k) return 0;
+      *hdrlen = 1 + k;
+      return 1 + k + value;
+    }
+    shift += 7;
+  }
+  return 0;
+}
+
 region_t* extract_requests_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
 {
-  char *mem;
-  unsigned int mem_count = 0;
-  unsigned int mem_size = 1024;
-  unsigned int region_count = 0;
-  unsigned int cur_start = 0;
-  unsigned int cur_end = 0;
+  // One region per packet; a truncated or malformed tail becomes one final
+  // region, so the regions always cover exactly the buffer.
   region_t *regions = NULL;
-  mem=(char *)ck_alloc(mem_size);
-  while(cur_start < buf_size)
-  {
-		if ((buf_size - cur_start) == 1) {
-			region_count++;
-			regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
-			regions[region_count - 1].start_byte = cur_start;
-			regions[region_count - 1].end_byte = buf_size - 1;
-			regions[region_count - 1].state_sequence = NULL;
-			regions[region_count - 1].state_count = 0;	
-			break;	
-		}
-    // Read the packet header
-    memcpy(&mem[mem_count], buf + cur_start, 2);
-    cur_start = cur_start + 2;
-    // Check the packet length and update current_end
-    // mem[0] is Message Type. mem[1] is Msg Len.
-    if(mem[1] >= 0) 
-      cur_end = cur_start + mem[1] - 1;
-    else
-      cur_end = buf_size;
-    // Create a region for every request
-		region_count++;
-		regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
-		regions[region_count - 1].start_byte = cur_start - 2;
-		regions[region_count - 1].end_byte = cur_end;
-		regions[region_count - 1].state_sequence = NULL;
-		regions[region_count - 1].state_count = 0;
-    // Update the indices
-    mem_count = 0;
-    cur_start = cur_end + 1;
-    cur_end = cur_start;
+  unsigned int region_count = 0, i = 0;
+
+  while (i < buf_size) {
+    unsigned int hdrlen, plen = mqtt_packet_len(buf + i, buf_size - i, &hdrlen);
+    int framed = (plen != 0);
+    if (!framed) plen = buf_size - i;
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + plen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += plen;
+    if (!framed) break;
   }
-  if(mem) ck_free(mem);
-  //in case region_count equals zero, it means that the structure of the buffer is broken
-  //hence we create one region for the whole buffer
-	if ((region_count == 0) && (buf_size > 0)) {
-		regions = (region_t *)ck_realloc(regions, sizeof(region_t));
-		regions[0].start_byte = 0;
-		regions[0].end_byte = buf_size - 1;
-		regions[0].state_sequence = NULL;
-		regions[0].state_count = 0;
-		region_count = 1;
-	}
-	*region_count_ref = region_count;
-	return regions;
+
+  *region_count_ref = region_count;
+  return regions;
 }
 
 region_t* extract_requests_sip(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
@@ -1458,66 +1429,25 @@ unsigned int* extract_response_codes_tftp(unsigned char* buf, unsigned int buf_s
 
 unsigned int* extract_response_codes_dhcp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
 {
-  char *mem;
-  unsigned int byte_count = 0;
-  unsigned int mem_count = 0;
-  unsigned int mem_size = 1024;
+  // One code per reply: its DHCP message type (option 53: 2 OFFER, 5 ACK,
+  // 6 NAK, ...), or 0x100 for a plain BOOTP reply without one. Stops at a
+  // reply that does not parse.
   unsigned int *state_sequence = NULL;
-  unsigned int state_count = 0;
-  char terminator_one[1] = {0x02};
-  char terminator_two[1] = {0x04};
-  char terminator_three[1] = {0x05};
-  char terminator_four[1] = {0x06};
-
-  mem=(char *)ck_alloc(mem_size);
+  unsigned int state_count = 0, i = 0;
 
   state_count++;
   state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
   state_sequence[state_count - 1] = 0;
 
-  while (byte_count < buf_size) {
-    memcpy(&mem[mem_count], buf + byte_count++, 1);
-
-    if ((mem_count > 240) && (((memcmp(&mem[mem_count - 1], terminator_one, 1) == 0) || (memcmp(&mem[mem_count - 1], terminator_two, 1) == 0))||
-     (memcmp(&mem[mem_count - 1], terminator_three, 1) == 0) || (memcmp(&mem[mem_count - 1], terminator_four, 1) == 0))) {
-      //Extract the response code which is the at the offset 240, which indicates the option field
-      char temp[5];
-      memcpy(temp, mem, 5);
-      temp[4] = 0x0;
-      unsigned int message_code = (unsigned int) atoi(temp);
-
-      if (message_code == 0) break;
-
-      message_code = get_mapped_message_code(message_code);
-
-      state_count++;
-      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
-      state_sequence[state_count - 1] = message_code;
-      mem_count = 0;
-    } else if (byte_count == buf_size){
-      char temp[5];
-      memcpy(temp, mem, 5);
-      temp[4] = 0x0;
-      unsigned int message_code = (unsigned int) atoi(temp);
-      if (message_code == 0) break;
-
-      message_code = get_mapped_message_code(message_code);
-
-      state_count++;
-      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
-      state_sequence[state_count - 1] = message_code;
-      //mem_count = 0;
-      break;
-    }else{
-      mem_count++;
-      if (mem_count == mem_size) {
-        //enlarge the mem buffer
-        mem_size = mem_size * 2;
-        mem=(char *)ck_realloc(mem, mem_size);
-      }
-    }
+  while (i < buf_size) {
+    unsigned int type, mlen = dhcp_message_len(buf + i, buf_size - i, &type);
+    if (!mlen) break;
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = type ? type : 0x100;
+    i += mlen;
   }
-  if (mem) ck_free(mem);
+
   *state_count_ref = state_count;
   return state_sequence;
 }
@@ -2291,67 +2221,31 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
 
 unsigned int* extract_response_codes_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
 {
-  unsigned char *mem;
-	unsigned int byte_count = 0;
-	unsigned int mem_count = 0;
-	unsigned int mem_size = 1024;
-	unsigned int *state_sequence = NULL;
-	unsigned int state_count = 0;
-  // Packet headers for MQTT broker responses
-	char start1[1]={0x20}; // Connect Ack
-	char start2[1]={0x40}; // Publish Ack
-  char start3[1]={0x50}; // Publish Receive
-  char start4[1]={0x62}; // Publish Release
-  char start5[1]={0x70}; // Publish complete
-	char start6[1]={0x90}; // Subscribe Ack
-  char start7[1]={0xB0}; // Unsubscribe Ack
-  char start8[1]={0xD0}; // Ping Response
-  char start9[1]={0xE0}; // Disconnect
-  char start10[1]={0xF0}; // Auth
-	mem=(unsigned char *)ck_alloc(mem_size);
-	// Initial state of the response state machine
-	state_count++;
-	state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
-	state_sequence[state_count - 1] = 0;
-  while(byte_count < buf_size)
-  {
-    // Copy the packet header to get the message type(mem[0])
-		memcpy(&mem[mem_count++], buf + byte_count++, 1);
-		memcpy(&mem[mem_count], buf + byte_count++, 1);
-    // printf("[fuzz]mem[0] is %02x\n",mem[0]);
-    // printf("[fuzz]mem[1] is %02x\n",mem[1]);
-    // Determine whether it's a response packet
-    if ((mem_count > 0) && ((memcmp(&mem[0], start1, 1) == 0) || (memcmp(&mem[0], start2, 1) == 0) || (memcmp(&mem[0], start3, 1) == 0) || (memcmp(&mem[0], start4, 1) == 0) || (memcmp(&mem[0], start5, 1) == 0) || (memcmp(&mem[0], start6, 1) == 0) || (memcmp(&mem[0], start7, 1) == 0) || (memcmp(&mem[0], start8, 1) == 0) || (memcmp(&mem[0], start9, 1) == 0) || (memcmp(&mem[0], start10, 1) == 0)))
-    {
-      // Get the response code(message type) from the packet
-      unsigned char message_code = (unsigned char)mem[0];
-      // printf("[fuzz]message_code is %02x\n",message_code);
-			if (message_code == 0) break;
+  // One code per broker packet: its first byte (type and flags: 0x30-0x3F
+  // PUBLISH, 0x40 PUBACK, 0x90 SUBACK, 0xD0 PINGRESP, ...), except CONNACK,
+  // which carries its return / reason code (0x2000 + code) so a refused
+  // connection is a state of its own. Stops at a truncated or malformed
+  // packet.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0, i = 0;
 
-      message_code = get_mapped_message_code(message_code);
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
 
-      // Create a new state 
-			state_count++;
-			state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
-			state_sequence[state_count - 1] = message_code;
-			mem_count = 0;
-      // yk
-			byte_count = byte_count + mem[1];
-    }
-    else
-    {
-      mem_count++;
-      if(mem_count == mem_size)
-      {
-        //enlarge the mem buffer
-        mem_size = mem_size * 2;
-        mem=(char *)ck_realloc(mem, mem_size); 
-      }
-    }
+  while (i < buf_size) {
+    unsigned int code, hdrlen, plen = mqtt_packet_len(buf + i, buf_size - i, &hdrlen);
+    if (!plen || buf[i] == 0) break;
+    code = buf[i];
+    if ((buf[i] & 0xF0) == 0x20 && plen >= hdrlen + 2) code = 0x2000 + buf[i + hdrlen + 1];
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = code;
+    i += plen;
   }
-	if (mem) ck_free(mem);
-	*state_count_ref = state_count;
-	return state_sequence;
+
+  *state_count_ref = state_count;
+  return state_sequence;
 }
 
 unsigned int* extract_response_codes_sip(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
@@ -2539,12 +2433,9 @@ static void resp_append_code(unsigned int code, unsigned int **state_sequence_re
   *state_count_ref = *state_count_ref + 1;
   *state_sequence_ref = (unsigned int *)ck_realloc(*state_sequence_ref, *state_count_ref * sizeof(unsigned int));
   if (*state_sequence_ref == NULL) PFATAL("Unable to realloc a memory region to store the state sequence");
-  (*state_sequence_ref)[*state_count_ref - 1] = get_mapped_message_code(code);
+  (*state_sequence_ref)[*state_count_ref - 1] = code;
 }
 
-// Walk one RESP reply (possibly a nested array) starting at offset and
-// append a mapped code per reply element. Returns the offset just past the
-// reply, or 0 if the framing is malformed so the caller stops parsing.
 static unsigned int resp_walk_reply(unsigned char* buf, unsigned int buf_size, unsigned int offset, unsigned int depth, unsigned int **state_sequence_ref, unsigned int *state_count_ref) {
   int number = 0;
   unsigned int off = offset;
@@ -2631,6 +2522,56 @@ static unsigned int resp_walk_reply(unsigned char* buf, unsigned int buf_size, u
         off = resp_walk_reply(buf, buf_size, off, depth + 1, state_sequence_ref, state_count_ref);
         if (off == 0) return 0;
       }
+      return off;
+    }
+    // RESP3 (after HELLO 3)
+    case '_': {
+      // Null: "_\r\n"
+      if ((off + 2 >= buf_size) || (buf[off + 1] != 0x0D) || (buf[off + 2] != 0x0A)) return 0;
+      resp_append_code(600, state_sequence_ref, state_count_ref);
+      return off + 3;
+    }
+    case ',':   // double
+    case '#':   // boolean
+    case '(': { // big number
+      unsigned int i;
+      for (i = off + 1; i < buf_size; i++) {
+        if (buf[i] == 0x0D) {
+          if ((i + 1 >= buf_size) || (buf[i + 1] != 0x0A)) return 0;
+          resp_append_code(buf[off] == ',' ? 601 : buf[off] == '#' ? 602 : 603,
+                           state_sequence_ref, state_count_ref);
+          return i + 2;
+        }
+      }
+      return 0; // unterminated line
+    }
+    case '!':   // blob error
+    case '=': { // verbatim string
+      unsigned int code = (buf[off] == '!') ? 604 : 605;
+      if (!read_resp_number(buf, buf_size, off + 1, &number, &off)) return 0;
+      if (number < 0) return 0;
+      if ((unsigned int)number > buf_size - off) return 0; // data overruns the buffer
+      off += number;
+      if ((off + 1 >= buf_size) || (buf[off] != 0x0D) || (buf[off + 1] != 0x0A)) return 0;
+      resp_append_code(code, state_sequence_ref, state_count_ref);
+      return off + 2;
+    }
+    case '%':   // map: N key/value pairs
+    case '~':   // set
+    case '>':   // push
+    case '|': { // attribute: N pairs, then the reply it annotates
+      unsigned int i, children;
+      unsigned char type = buf[off];
+      if (!read_resp_number(buf, buf_size, off + 1, &number, &off)) return 0;
+      if (number < 0) return 0;
+      children = (type == '%' || type == '|') ? 2 * (unsigned int)number : (unsigned int)number;
+      resp_append_code(type == '%' ? 700 : type == '~' ? 701 : type == '>' ? 702 : 703,
+                       state_sequence_ref, state_count_ref);
+      for (i = 0; i < children; i++) {
+        off = resp_walk_reply(buf, buf_size, off, depth + 1, state_sequence_ref, state_count_ref);
+        if (off == 0) return 0;
+      }
+      if (type == '|') return resp_walk_reply(buf, buf_size, off, depth + 1, state_sequence_ref, state_count_ref);
       return off;
     }
     default:
@@ -3017,4 +2958,1038 @@ u32 read_bytes_to_uint32(unsigned char* buf, unsigned int offset, int num_bytes)
     val = (val << 8) + buf[i+offset];
   }
   return val;
+}
+
+region_t* extract_requests_memcached(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  unsigned int byte_count = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+  unsigned int cur_start = 0;
+
+  while (byte_count < buf_size) {
+    // memcached's text protocol is line based: every LF terminates one
+    // request line (or the data block of a "set"-family command, which the
+    // server consumes as its next line)
+    if (buf[byte_count] == '\n') {
+      region_count++;
+      regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+      regions[region_count - 1].start_byte = cur_start;
+      regions[region_count - 1].end_byte = byte_count;
+      regions[region_count - 1].state_sequence = NULL;
+      regions[region_count - 1].state_count = 0;
+      cur_start = byte_count + 1;
+    }
+    byte_count++;
+  }
+
+  if (cur_start < buf_size) { // trailing partial line keeps its own region
+    region_count++;
+    regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+    regions[region_count - 1].start_byte = cur_start;
+    regions[region_count - 1].end_byte = buf_size - 1;
+    regions[region_count - 1].state_sequence = NULL;
+    regions[region_count - 1].state_count = 0;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+// The numeric value of the index-th space-separated token of a reply line
+// (0 if absent; capped so a mutated size cannot overflow).
+static unsigned int memcached_token_number(const unsigned char* line, unsigned int len, unsigned int index)
+{
+  unsigned int p = 0, value = 0;
+  while (index--) {
+    while (p < len && line[p] != ' ') p++;
+    while (p < len && line[p] == ' ') p++;
+  }
+  while (p < len && line[p] >= '0' && line[p] <= '9' && value < 0x10000000)
+    value = value * 10 + (line[p++] - '0');
+  return value;
+}
+
+// Classify one reply line (CR/LF stripped) by its first token, text and
+// meta protocol alike. "VALUE <key> <flags> <bytes>" and "VA <bytes>"
+// announce a data block of that many bytes plus CRLF: *data_len.
+static unsigned int memcached_line_code(const unsigned char* line, unsigned int len, unsigned int* data_len)
+{
+  unsigned int tlen = 0, q;
+  *data_len = 0;
+  while (tlen < len && line[tlen] != ' ') tlen++;
+  if (tlen == 0) return 0; // empty line carries no state
+#define MEMC_TOK(s) (tlen == (unsigned int)(sizeof(s) - 1) && !memcmp(line, s, sizeof(s) - 1))
+  if (MEMC_TOK("STORED"))       return 1;
+  if (MEMC_TOK("DELETED"))      return 2;
+  if (MEMC_TOK("VALUE"))        { *data_len = memcached_token_number(line, len, 3); return 3; }
+  if (MEMC_TOK("END"))          return 4;
+  if (MEMC_TOK("STAT"))         return 5;
+  if (MEMC_TOK("OK"))           return 6;
+  if (MEMC_TOK("TOUCHED"))      return 7;
+  if (MEMC_TOK("VERSION"))      return 8;
+  if (MEMC_TOK("ERROR"))        return 9;
+  if (MEMC_TOK("CLIENT_ERROR")) return 10;
+  if (MEMC_TOK("SERVER_ERROR")) return 11;
+  if (MEMC_TOK("NOT_FOUND"))    return 12;
+  if (MEMC_TOK("NOT_STORED"))   return 13;
+  if (MEMC_TOK("EXISTS"))       return 14;
+  // meta protocol (mg/ms/md/ma/mn)
+  if (MEMC_TOK("HD"))           return 16;
+  if (MEMC_TOK("VA"))           { *data_len = memcached_token_number(line, len, 1); return 17; }
+  if (MEMC_TOK("EN"))           return 18;
+  if (MEMC_TOK("NF"))           return 19;
+  if (MEMC_TOK("NS"))           return 20;
+  if (MEMC_TOK("EX"))           return 21;
+  if (MEMC_TOK("MN"))           return 22;
+  if (MEMC_TOK("RESET"))        return 23;
+  if (MEMC_TOK("BUSY"))         return 25;
+  if (MEMC_TOK("BADCLASS"))     return 26;
+#undef MEMC_TOK
+  for (q = 0; q < tlen && line[q] >= '0' && line[q] <= '9'; q++);
+  if (q == tlen) return 24; // incr/decr result
+  return 15;                // other non-empty line
+}
+
+unsigned int* extract_response_codes_memcached(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+  unsigned int i = 0;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0; // initial status code is 0
+
+  while (i < buf_size) {
+    unsigned int j = i, len, code, data_len;
+    while (j < buf_size && buf[j] != '\n') j++;
+    if (j == buf_size) break; // partial line: wait for its LF
+    len = j - i;
+    if (len > 0 && buf[i + len - 1] == '\r') len--;
+    code = memcached_line_code(buf + i, len, &data_len);
+    if (code != 0) {
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = code;
+    }
+    i = j + 1;
+    if (data_len) { // skip the data block and its CRLF
+      if (data_len > buf_size - i || data_len + 2 > buf_size - i) break;
+      i += data_len + 2;
+    }
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+// NTP packet sizes: the 48-byte header alone, with a 4-byte key ID, or
+// with a key ID and a 16-byte (MD5) or 20-byte (SHA1) digest.
+static const unsigned int ntp_packet_sizes[4] = {48, 52, 68, 72};
+
+// A plausible first byte of a client packet: nonzero version (the seeds
+// probe versions up to 5) and nonzero mode.
+static int ntp_request_start(unsigned char b)
+{
+  return ((b >> 3) & 7) != 0 && (b & 7) != 0;
+}
+
+// A server reply's first byte: leap indicator 0, mode 4 (server).
+static int ntp_reply_start(unsigned char b)
+{
+  return (b & 0xC7) == 0x04;
+}
+
+// The size of the packet at b: the shortest of ntp_packet_sizes after
+// which the buffer ends or the next packet plausibly starts; 0 if none.
+static unsigned int ntp_packet_len(const unsigned char* b, unsigned int rem, int reply)
+{
+  unsigned int k;
+  for (k = 0; k < 4; k++) {
+    unsigned int len = ntp_packet_sizes[k];
+    if (len == rem) return len;
+    if (len < rem && (reply ? ntp_reply_start(b[len]) : ntp_request_start(b[len]))) return len;
+  }
+  return 0;
+}
+
+region_t* extract_requests_chrony(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  // NTP over UDP: one region per packet, each sent as one datagram. A
+  // packet is 48, 52, 68 or 72 bytes (ntp_packet_len); when no size lines
+  // up with a plausible next packet, a remainder of at most 72 bytes is one
+  // packet and a longer one splits after 48. A short tail is its own
+  // region. The old whole-file-as-one-region design sent the concatenated
+  // seed as one datagram that chronyd silently dropped.
+  region_t *regions = NULL;
+  unsigned int region_count = 0;
+  unsigned int i = 0;
+
+  while (i < buf_size) {
+    unsigned int rem = buf_size - i, len = ntp_packet_len(buf + i, rem, 0);
+    if (!len) len = (rem > 72) ? 48 : rem;
+    unsigned int end = i + len;
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = end - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i = end;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_chrony(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // NTP server reply: byte0 = LI(2b)|VN(2b)|Mode(4b) with Mode=4, LI=0 --
+  // 0x1c for VN3 clients, 0x24 for VN4. chronyd answers in the client's own
+  // version, so match on the mode nibble, not one byte value: the original
+  // 0x24-only split missed every VN3 reply (the seeds are VN3), the state
+  // sequence stayed [0], zero transitions were ever recorded, and afl-fuzz
+  // PFATALed with "states hashtable ... initial state" on seed 1.
+  // byte1 carries the stratum; map (stratum, VN/LI bits) to a state code.
+  unsigned int byte_count = 0;
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0; // initial status code is 0
+
+  while (byte_count + 2 <= buf_size) {
+    if (ntp_reply_start(buf[byte_count])) {
+      unsigned int code = 1 + ((buf[byte_count + 1] & 0x0f) << 2) + ((buf[byte_count] >> 5) & 0x03);
+      unsigned int len = ntp_packet_len(buf + byte_count, buf_size - byte_count, 1);
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = code;
+      // skip the reply body and its key ID / MAC; a stray reply-like byte
+      // inside timestamps or a digest is not a new reply
+      byte_count += len ? len : 48;
+    } else {
+      byte_count++;
+    }
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+
+region_t* extract_requests_chronyc(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  // chrony CANDM command protocol (cmdmon, UDP): each request is one
+  // datagram with header 06 01 00 00 | command(u16 BE) | attempt(u16 BE)
+  // | sequence(u32 BE) | body. Split at the next header magic (06 01 00 00);
+  // a tail that does not parse becomes one final region so nothing is lost.
+  // Deterministic scan: same bytes -> same regions on every run.
+  region_t *regions = NULL;
+  unsigned int region_count = 0;
+  unsigned int i = 0;
+
+  while (i < buf_size) {
+    unsigned int j;
+    int hdr = (buf[i] == 0x06 && i + 4 <= buf_size && buf[i + 1] == 0x01 &&
+               buf[i + 2] == 0 && buf[i + 3] == 0);
+    if (hdr) {
+      j = i + 12; // smallest sensible request: 12-byte header + body
+      while (j + 4 <= buf_size) {
+        if (buf[j] == 0x06 && buf[j + 1] == 0x01 && buf[j + 2] == 0 && buf[j + 3] == 0) break;
+        j++;
+      }
+      // no further header: this request runs to the end of the buffer
+      if (j + 4 > buf_size) j = buf_size;
+    } else {
+      j = buf_size; // unparsable remainder: one region
+    }
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = j - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i = j;
+    if (!hdr) break;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_chronyc(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // Response: 06 02 00 00 | command(u16 BE) | reply(u16 BE) | status(u16 BE)
+  // | ... State code = 0x10000 + (command << 8) + status (low bytes), so a
+  // refused command (STT_UNAUTH, STT_BADPKTLENGTH, ...) is its own state.
+  // Body multi-record sections may contain accidental header matches;
+  // they only add (deterministic) states, never remove any.
+  unsigned int byte_count = 0;
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0; // initial state
+
+  while (byte_count + 12 <= buf_size) {
+    if (buf[byte_count] == 0x06 && buf[byte_count + 1] == 0x02 &&
+        buf[byte_count + 2] == 0 && buf[byte_count + 3] == 0) {
+      unsigned int cmd = buf[byte_count + 5], status = buf[byte_count + 9];
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = 0x10000 + (cmd << 8) + status;
+      byte_count += 12;
+    } else {
+      byte_count++;
+    }
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+// CoAP over TCP (RFC 8323), the transport the libcoap cell fuzzes: byte 0
+// is Len(4 bits) | TKL(4 bits); Len 13/14/15 adds 1/2/4 extended-length
+// bytes (+13/+269/+65805); then the Code byte; TKL 13/14 (RFC 8974) adds
+// 1/2 extended token-length bytes (+13/+269); then the token, then Len
+// bytes of options and payload. Returns the message length, or 0 when
+// the buffer does not hold one complete message; *code_off receives the
+// offset of the Code byte.
+static unsigned int coap_tcp_message_len(const unsigned char* b, unsigned int rem, unsigned int* code_off)
+{
+  unsigned long long len = b[0] >> 4, tkl = b[0] & 0x0f, total;
+  unsigned int p = 1, k, ext;
+  if (rem < 2 || tkl == 15) return 0;
+  ext = (len == 13) ? 1 : (len == 14) ? 2 : (len == 15) ? 4 : 0;
+  if (rem < 1 + ext + 1) return 0;
+  if (ext) {
+    unsigned long long v = 0;
+    for (k = 0; k < ext; k++) v = (v << 8) | b[p + k];
+    len = v + (ext == 1 ? 13 : ext == 2 ? 269 : 65805);
+    p += ext;
+  }
+  *code_off = p++;
+  if (tkl >= 13) {
+    unsigned int text = (tkl == 13) ? 1 : 2;
+    if (rem < p + text) return 0;
+    tkl = (text == 1) ? 13 + b[p] : 269 + (((unsigned int)b[p] << 8) | b[p + 1]);
+    p += text;
+  }
+  total = p + tkl + len;
+  if (total > rem) return 0;
+  return (unsigned int)total;
+}
+
+region_t* extract_requests_coap(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  // One region per RFC 8323 message; a tail that does not frame becomes
+  // one final region, so the regions always cover the whole buffer.
+  region_t *regions = NULL;
+  unsigned int region_count = 0, i = 0;
+
+  while (i < buf_size) {
+    unsigned int code_off, mlen = coap_tcp_message_len(buf + i, buf_size - i, &code_off);
+    int framed = (mlen != 0);
+    if (!framed) mlen = buf_size - i;
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + mlen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += mlen;
+    if (!framed) break;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_coap(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // One code per RFC 8323 message: its Code byte (0x45 = 2.05 Content,
+  // 0x84 = 4.04 Not Found, 0xE1 = 7.01 CSM, 0xE3 = 7.03 Pong, ...); empty
+  // messages (code 0) carry no state. Stops at a message that does not
+  // frame.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0, i = 0;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0; // initial status code is 0
+
+  while (i < buf_size) {
+    unsigned int code_off, mlen = coap_tcp_message_len(buf + i, buf_size - i, &code_off);
+    if (!mlen) break;
+    if (buf[i + code_off] != 0) {
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = buf[i + code_off];
+    }
+    i += mlen;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+region_t* extract_requests_imap(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  // IMAP is line-based: one tagged command per CRLF-terminated line.
+  // Literals ("{N}" + N raw octets) exist but are rare in hand-built seeds;
+  // a CRLF split keeps every well-formed command intact and turns
+  // literal-carrying mutants into extra (server-rejected) regions.
+  region_t *regions = NULL;
+  unsigned int region_count = 0;
+  unsigned int i = 0, start = 0;
+
+  while (i < buf_size) {
+    if (buf[i] == '\n') {
+      regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+      regions[region_count].start_byte = start;
+      regions[region_count].end_byte = i;
+      regions[region_count].state_sequence = NULL;
+      regions[region_count].state_count = 0;
+      region_count++;
+      start = i + 1;
+    }
+    i++;
+  }
+  if (start < buf_size) { // trailing partial line keeps its own region
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = start;
+    regions[region_count].end_byte = buf_size - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+// Classify one IMAP response line into a small deterministic state code.
+// Untagged:  "* OK/NO/BAD/BYE/PREAUTH", "* CAPABILITY/FLAGS/...", and the
+// number-first forms "* <n> FETCH/EXISTS/EXPUNGE/RECENT" (name = token 3).
+// Tagged:    "<tag> OK/NO/BAD". Continuation "+" lines get their own code.
+static unsigned int imap_line_code(const unsigned char* line, unsigned int len)
+{
+  unsigned int p = 0, ts, tlen, q;
+  int untagged, allnum;
+
+  while (p < len && (line[p] == ' ' || line[p] == '\r' || line[p] == '\n')) p++;
+  ts = p;
+  while (p < len && line[p] != ' ' && line[p] != '\r' && line[p] != '\n') p++;
+  tlen = p - ts;
+  if (tlen == 0) return 0; // blank line carries no state
+  if (tlen == 1 && line[ts] == '+') return 24; // continuation request
+  untagged = (tlen == 1 && line[ts] == '*');
+
+  // token 2
+  while (p < len && line[p] == ' ') p++;
+  ts = p;
+  while (p < len && line[p] != ' ' && line[p] != '\r' && line[p] != '\n') p++;
+  tlen = p - ts;
+  if (tlen == 0) return untagged ? 6 : 34;
+
+  if (untagged) {
+    allnum = 1;
+    for (q = ts; q < ts + tlen; q++) {
+      if (line[q] < '0' || line[q] > '9') { allnum = 0; break; }
+    }
+    if (allnum) {
+      // "* <n> NAME ..." -- the response name is token 3
+      while (p < len && line[p] == ' ') p++;
+      ts = p;
+      while (p < len && line[p] != ' ' && line[p] != '\r' && line[p] != '\n') p++;
+      tlen = p - ts;
+      if (tlen == 0) return 6;
+    }
+  }
+
+#define IMAP_TOK(s) (tlen == (unsigned int)(sizeof(s) - 1) && !strncmp((const char*)line + ts, s, sizeof(s) - 1))
+  if (IMAP_TOK("OK"))          return untagged ? 1 : 31;
+  if (IMAP_TOK("NO"))          return untagged ? 2 : 32;
+  if (IMAP_TOK("BAD"))         return untagged ? 3 : 33;
+  if (IMAP_TOK("BYE"))         return 4;
+  if (IMAP_TOK("PREAUTH"))     return 5;
+  if (IMAP_TOK("CAPABILITY"))  return 7;
+  if (IMAP_TOK("FLAGS"))       return 8;
+  if (IMAP_TOK("LIST"))        return 9;
+  if (IMAP_TOK("LSUB"))        return 10;
+  if (IMAP_TOK("SEARCH"))      return 11;
+  if (IMAP_TOK("SORT"))        return 12;
+  if (IMAP_TOK("STATUS"))      return 13;
+  if (IMAP_TOK("FETCH"))       return 14;
+  if (IMAP_TOK("EXPUNGE"))     return 15;
+  if (IMAP_TOK("EXISTS"))      return 16;
+  if (IMAP_TOK("RECENT"))      return 17;
+  if (IMAP_TOK("UIDVALIDITY")) return 18;
+  if (IMAP_TOK("UIDNEXT"))     return 19;
+  if (IMAP_TOK("NAMESPACE"))   return 20;
+  if (IMAP_TOK("ENABLE"))      return 21;
+  if (IMAP_TOK("ID"))          return 22;
+#undef IMAP_TOK
+  return untagged ? 23 : 34;
+}
+
+// A line (LF excluded) ending in "{N}" or "{N+}" announces N literal octets
+// after its LF; returns 1 and sets *n when it does.
+static int imap_literal_len(const unsigned char* line, unsigned int len, unsigned int* n)
+{
+  unsigned int p, s, value = 0;
+  if (len && line[len - 1] == '\r') len--;
+  if (!len || line[len - 1] != '}') return 0;
+  p = len - 1;
+  if (p && line[p - 1] == '+') p--;
+  s = p;
+  while (s && line[s - 1] >= '0' && line[s - 1] <= '9') s--;
+  if (s == p || s == 0 || line[s - 1] != '{') return 0;
+  for (; s < p; s++) {
+    value = value * 10 + (line[s] - '0');
+    if (value > 0x0fffffff) value = 0x0fffffff; // runs past any buffer
+  }
+  *n = value;
+  return 1;
+}
+
+unsigned int* extract_response_codes_imap(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // One code per response. A response whose line ends in a literal
+  // announcement continues after the literal octets (message bodies,
+  // headers) up to the next LF, again possibly with a literal: none of
+  // that is classified as a line of its own.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+  unsigned int i = 0, code;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0; // initial status code is 0
+
+  while (i < buf_size) {
+    unsigned int seg = i, j = i, n;
+    while (j < buf_size && buf[j] != '\n') j++;
+    // a trailing partial line is classified too
+    code = imap_line_code(buf + i, j - i);
+    if (code != 0) {
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = code;
+    }
+    while (j < buf_size && imap_literal_len(buf + seg, j - seg, &n)) {
+      if (n >= buf_size - j) { j = buf_size; break; }
+      seg = j + 1 + n;
+      j = seg;
+      while (j < buf_size && buf[j] != '\n') j++;
+    }
+    i = j + 1;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+// HTTP/2 over TCP (h2c prior knowledge): the 24-byte client connection
+// preface magic ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") is region 0, then
+// 9-byte frame headers (3-byte BE length + type + flags + stream id).
+// Unparsable tail = one final region.
+static const char h2_preface[24] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+region_t* extract_requests_http2(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  region_t *regions = NULL;
+  unsigned int region_count = 0, i = 0;
+  if (buf_size >= 24 && !memcmp(buf, h2_preface, 24)) {
+    regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+    regions[0].start_byte = 0; regions[0].end_byte = 23;
+    regions[0].state_sequence = NULL; regions[0].state_count = 0;
+    region_count = 1; i = 24;
+  }
+  while (i < buf_size) {
+    unsigned int flen, mlen;
+    if (buf_size - i < 9) mlen = buf_size - i;
+    else {
+      flen = ((unsigned int)buf[i] << 16) | ((unsigned int)buf[i+1] << 8) | buf[i+2];
+      if (i + 9 + flen > buf_size) mlen = buf_size - i;
+      else mlen = 9 + flen;
+    }
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + mlen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += mlen;
+    if (mlen < 9) break;
+  }
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_http2(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // State code = 100 + frame type (0 DATA, 1 HEADERS, 3 RST_STREAM,
+  // 4 SETTINGS, 6 PING, 7 GOAWAY, 8 WINDOW_UPDATE, 5 PUSH_PROMISE):
+  // the frame-type sequence IS the h2 session state machine. SETTINGS and
+  // PING acknowledgements get 200 + type, RST_STREAM and GOAWAY carry
+  // their error code (1000 + code, 2000 + code).
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0, i = 0;
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+  while (i + 9 <= buf_size) {
+    unsigned int flen = ((unsigned int)buf[i] << 16) | ((unsigned int)buf[i+1] << 8) | buf[i+2];
+    if (i + 9 + flen > buf_size) break;
+    unsigned int type = buf[i+3], code = 100 + type;
+    if ((type == 4 || type == 6) && (buf[i+4] & 0x01)) {
+      code = 200 + type;  // SETTINGS / PING with the ACK flag
+    } else if (type == 3 && flen >= 4) {
+      // RST_STREAM: 1000 + error code (unknown codes share 1255)
+      unsigned int error = ((unsigned int)buf[i+9] << 24) | ((unsigned int)buf[i+10] << 16) |
+                           ((unsigned int)buf[i+11] << 8) | buf[i+12];
+      code = 1000 + (error < 0xff ? error : 0xff);
+    } else if (type == 7 && flen >= 8) {
+      // GOAWAY: 2000 + error code (after the 4-byte last stream id)
+      unsigned int error = ((unsigned int)buf[i+13] << 24) | ((unsigned int)buf[i+14] << 16) |
+                           ((unsigned int)buf[i+15] << 8) | buf[i+16];
+      code = 2000 + (error < 0xff ? error : 0xff);
+    }
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = code;
+    i += 9 + flen;
+  }
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+region_t* extract_requests_bgp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  // BGP packet: 16-byte all-FF marker + 2-byte BE length (incl. header,
+  // min 19, max 4096) + 1-byte type. Split on the length field; a tail that
+  // does not parse (mutant) becomes one final region so nothing is lost.
+  region_t *regions = NULL;
+  unsigned int region_count = 0;
+  unsigned int i = 0;
+
+  while (i < buf_size) {
+    unsigned int plen = 0, j;
+    int marker_ok = (buf_size - i >= 19);
+    if (marker_ok) {
+      for (j = i; j < i + 16; j++) if (buf[j] != 0xFF) { marker_ok = 0; break; }
+    }
+    if (marker_ok) {
+      plen = (buf[i + 16] << 8) | buf[i + 17];
+      if (plen < 19 || plen > 4096 || i + plen > buf_size) marker_ok = 0;
+    }
+    if (!marker_ok) plen = buf_size - i; // unparsable remainder: one region
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + plen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += plen;
+    if (!marker_ok) break;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_bgp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // State codes: 1=OPEN 2=UPDATE 3=NOTIFICATION(+major*10) 4=KEEPALIVE
+  // 5=ROUTE-REFRESH, scanned packet by packet; initial state 0.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+  unsigned int i = 0;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (i + 19 <= buf_size) {
+    unsigned int j, plen, code;
+    int marker_ok = 1;
+    for (j = i; j < i + 16; j++) if (buf[j] != 0xFF) { marker_ok = 0; break; }
+    if (!marker_ok) break;
+    plen = (buf[i + 16] << 8) | buf[i + 17];
+    if (plen < 19 || i + plen > buf_size) break;
+    switch (buf[i + 18]) {
+      case 1: code = 1; break; // OPEN
+      case 2: code = 2; break; // UPDATE
+      case 3: code = (plen >= 21) ? (30 + buf[i + 19] * 10) : 30; break; // NOTIFICATION+major
+      case 4: code = 4; break; // KEEPALIVE
+      case 5: code = 5; break; // ROUTE-REFRESH
+      default: code = 9; break;
+    }
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = code;
+    i += plen;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+// SNMP over UDP: BER SEQUENCE framing. Length is short-form (<0x80) or
+// long-form (0x8N + N big-endian bytes). An unparsable tail becomes one
+// final region (mutation surface, server drops it).
+static unsigned int snmp_ber_len(const unsigned char* b, unsigned int rem, unsigned int* hdrlen)
+{
+  unsigned int i, l;
+  if (rem < 2) { *hdrlen = 0; return 0; }
+  l = b[1];
+  if (!(l & 0x80)) { *hdrlen = 2; return l; }
+  unsigned int n = l & 0x7f;
+  if (n == 0 || n > 4 || rem < 2 + n) { *hdrlen = 0; return 0; }
+  l = 0;
+  for (i = 0; i < n; i++) l = (l << 8) | b[2 + i];
+  *hdrlen = 2 + n;
+  return l;
+}
+
+static unsigned int snmp_content_len(const unsigned char* b, unsigned int rem, unsigned int* hdrlen)
+{
+  if (rem < 2 || b[0] != 0x30) { *hdrlen = 0; return 0; }
+  return snmp_ber_len(b, rem, hdrlen);
+}
+
+// One BER TLV at pos inside [pos, end): its tag, content start and the
+// position after it. Returns 0 when it does not fit.
+static int snmp_tlv(const unsigned char* buf, unsigned int pos, unsigned int end,
+                    unsigned int* tag, unsigned int* start, unsigned int* next)
+{
+  unsigned int hdrlen, len;
+  if (pos >= end) return 0;
+  len = snmp_ber_len(buf + pos, end - pos, &hdrlen);
+  if (hdrlen == 0 || len > end - pos - hdrlen) return 0;
+  *tag = buf[pos];
+  *start = pos + hdrlen;
+  *next = pos + hdrlen + len;
+  return 1;
+}
+
+// The PDU tag of one message whose SEQUENCE content is [p, end), or 0:
+// v1/v2c  version INTEGER, community OCTET STRING, PDU;
+// v3      version INTEGER, msgGlobalData SEQUENCE, msgSecurityParameters
+//         OCTET STRING, then the ScopedPDU SEQUENCE { contextEngineID,
+//         contextName, PDU } or, encrypted, an OCTET STRING (code 0x100).
+static unsigned int snmp_pdu_tag(const unsigned char* buf, unsigned int p, unsigned int end)
+{
+  unsigned int tag, start, next, version;
+  if (!snmp_tlv(buf, p, end, &tag, &start, &next) || tag != 0x02 || start == next) return 0;
+  version = buf[next - 1];
+  p = next;
+  if (version == 3) {
+    if (!snmp_tlv(buf, p, end, &tag, &start, &next) || tag != 0x30) return 0;
+    p = next;
+    if (!snmp_tlv(buf, p, end, &tag, &start, &next) || tag != 0x04) return 0;
+    p = next;
+    if (!snmp_tlv(buf, p, end, &tag, &start, &next)) return 0;
+    if (tag == 0x04) return 0x100;
+    if (tag != 0x30) return 0;
+    p = start;
+    end = next;
+    if (!snmp_tlv(buf, p, end, &tag, &start, &next) || tag != 0x04) return 0;
+    p = next;
+  }
+  if (!snmp_tlv(buf, p, end, &tag, &start, &next) || tag != 0x04) return 0;
+  p = next;
+  // 0xA0 GetRequest ... 0xA2 Response ... 0xA7 SNMPv2-Trap, 0xA8 Report
+  if (p < end && buf[p] >= 0xA0 && buf[p] <= 0xA8) return buf[p];
+  return 0;
+}
+
+region_t* extract_requests_snmp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  region_t *regions = NULL;
+  unsigned int region_count = 0, i = 0;
+  while (i < buf_size) {
+    unsigned int hdrlen = 0, clen = snmp_content_len(buf + i, buf_size - i, &hdrlen);
+    unsigned int mlen;
+    if (hdrlen == 0 || clen > buf_size - i - hdrlen) mlen = buf_size - i; // unparsable: rest is one region
+    else mlen = hdrlen + clen;
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + mlen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    if (mlen == 0) break;
+    i += mlen;
+    if (hdrlen == 0) break;
+  }
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_snmp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // State code = the PDU tag byte (0xA2 Response, 0xA8 Report, ...; 0x100
+  // for an encrypted v3 ScopedPDU), for SNMPv1, v2c and v3 alike. A
+  // message whose inside does not parse adds no state; the walk goes on
+  // with the next message, which the outer SEQUENCE length locates.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0, i = 0;
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+  while (i < buf_size) {
+    unsigned int hdrlen = 0, clen = snmp_content_len(buf + i, buf_size - i, &hdrlen);
+    if (hdrlen == 0 || clen > buf_size - i - hdrlen) break;
+    unsigned int p = i + hdrlen, end = p + clen;
+    unsigned int code = snmp_pdu_tag(buf, p, end);
+    if (code) {
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = code;
+    }
+    i = end;
+  }
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+region_t* extract_requests_pgsql(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  // PostgreSQL v3 frontend wire format: the FIRST message (startup) is
+  // 4-byte BE length (self-inclusive) + params, no type byte; every later
+  // message is 1 type byte + 4-byte BE length (covers itself, not the type
+  // byte) + payload. Split accordingly; an unparsable tail becomes one
+  // final region so mutants still reach the server.
+  region_t *regions = NULL;
+  unsigned int region_count = 0;
+  unsigned int i = 0;
+  int first = 1;
+
+  while (i < buf_size) {
+    unsigned int mlen;
+    if (first) {
+      if (buf_size - i < 4) { mlen = buf_size - i; }
+      else {
+        mlen = ((unsigned int)buf[i] << 24) | ((unsigned int)buf[i+1] << 16) |
+               ((unsigned int)buf[i+2] << 8) | buf[i+3];
+        if (mlen < 8 || mlen > buf_size - i) mlen = buf_size - i;
+      }
+      // An SSLRequest or GSSENCRequest (length 8, code 80877103/80877104)
+      // is answered with one byte; the startup message that follows it is
+      // untyped too.
+      first = (mlen == 8 && buf[i+4] == 0x04 && buf[i+5] == 0xd2 && buf[i+6] == 0x16 &&
+               (buf[i+7] == 0x2f || buf[i+7] == 0x30));
+    } else {
+      if (buf_size - i < 5) { mlen = buf_size - i; }
+      else {
+        unsigned int blen = ((unsigned int)buf[i+1] << 24) | ((unsigned int)buf[i+2] << 16) |
+                            ((unsigned int)buf[i+3] << 8) | buf[i+4];
+        if (blen < 4 || blen > buf_size - i - 1) mlen = buf_size - i;
+        else mlen = 1 + blen;
+      }
+    }
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + mlen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += mlen;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_pgsql(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // Backend messages: 1 type byte + 4-byte BE length (self-inclusive).
+  // The state code IS the message type byte (R=auth, K=backend key,
+  // Z=ready-for-query, T=row desc, D=data row, C=command complete,
+  // E=error, S=parameter status, ...): injective, table-free, and mirrors
+  // exactly what the client state machine observes. Initial state 0.
+  // Before the first typed message, the one-byte answers to SSLRequest /
+  // GSSENCRequest ('N' refused, 'S' / 'G' accepted) get 0x100 + byte.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+  unsigned int i = 0;
+  int typed = 0;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (i < buf_size) {
+    unsigned int code, step;
+    unsigned int blen = 0;
+    if (buf_size - i >= 5)
+      blen = ((unsigned int)buf[i+1] << 24) | ((unsigned int)buf[i+2] << 16) |
+             ((unsigned int)buf[i+3] << 8) | buf[i+4];
+    if (buf_size - i >= 5 && blen >= 4 && blen <= buf_size - i - 1) {
+      code = buf[i];
+      step = 1 + blen;
+      typed = 1;
+    } else if (!typed && (buf[i] == 'N' || buf[i] == 'S' || buf[i] == 'G')) {
+      code = 0x100 + buf[i];
+      step = 1;
+    } else break;
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = code;
+    i += step;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+// RADIUS over UDP: code(1) id(1) length(2 BE, >=20, includes header)
+// authenticator(16) attributes. Length-field split; unparsable tail = one
+// final region.
+region_t* extract_requests_radius(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  region_t *regions = NULL;
+  unsigned int region_count = 0, i = 0;
+  while (i < buf_size) {
+    unsigned int plen;
+    if (buf_size - i < 20) plen = buf_size - i;
+    else {
+      plen = ((unsigned int)buf[i+2] << 8) | buf[i+3];
+      if (plen < 20 || i + plen > buf_size) plen = buf_size - i;
+    }
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + plen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += plen;
+    if (plen < 20) break;
+  }
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_radius(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // State code = the packet Code byte (2 Access-Accept, 3 Access-Reject,
+  // 5 Accounting-Response, 11 Access-Challenge, ...): the AAA state
+  // machine in one byte.
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0, i = 0;
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+  while (i + 20 <= buf_size) {
+    unsigned int plen = ((unsigned int)buf[i+2] << 8) | buf[i+3];
+    if (plen < 20 || i + plen > buf_size) break;
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = buf[i];
+    i += plen;
+  }
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+// RDP over TCP: TPKT framing (03 00 + 2-byte BE length incl. the 4-byte
+// header) wrapping X.224/MCS PDUs, and fast-path PDUs once the connection
+// is up. Unparsable tail = one final region.
+
+// Fast-path PDU (client input or server output): action bits 0-1 = 0,
+// then the PDU length in 1 byte, or in 2 bytes (15 bits) when the first
+// one has its top bit set. Returns the length, or 0 if not one.
+static unsigned int rdp_fastpath_len(const unsigned char* b, unsigned int rem, unsigned int* hdrlen)
+{
+  unsigned int len;
+  if (rem < 2 || (b[0] & 0x03) != 0) return 0;
+  if (b[1] & 0x80) {
+    if (rem < 3) return 0;
+    len = ((unsigned int)(b[1] & 0x7f) << 8) | b[2];
+    *hdrlen = 3;
+  } else {
+    len = b[1];
+    *hdrlen = 2;
+  }
+  if (len < *hdrlen || len > rem) return 0;
+  return len;
+}
+
+region_t* extract_requests_rdp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  region_t *regions = NULL;
+  unsigned int region_count = 0, i = 0;
+  while (i < buf_size) {
+    unsigned int plen = 0, hdrlen, rem = buf_size - i;
+    if (rem >= 4 && buf[i] == 3 && buf[i+1] == 0) {
+      plen = ((unsigned int)buf[i+2] << 8) | buf[i+3];
+      if (plen < 4 || plen > rem) plen = 0;
+    } else {
+      plen = rdp_fastpath_len(buf + i, rem, &hdrlen);
+    }
+    int framed = (plen != 0);
+    if (!framed) plen = rem;
+    regions = (region_t *)ck_realloc(regions, (region_count + 1) * sizeof(region_t));
+    regions[region_count].start_byte = i;
+    regions[region_count].end_byte = i + plen - 1;
+    regions[region_count].state_sequence = NULL;
+    regions[region_count].state_count = 0;
+    region_count++;
+    i += plen;
+    if (!framed) break;
+  }
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int* extract_response_codes_rdp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  // State codes: X.224 TPDU code (0xD0 Connect-Confirm, 0xE0 Connect/Data
+  // variants, 0xF0 DT-Data) refined by the first MCS payload byte for data
+  // PDUs: code = x224, or 0x1000+payload for 0xF0 frames. Fast-path output
+  // PDUs: 0x2000 + the update code of their first update (0x2FFF when
+  // encrypted, 0x2FFE when empty).
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0, i = 0;
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+  while (i < buf_size) {
+    unsigned int plen, hdrlen, code, rem = buf_size - i;
+    if (rem >= 4 && buf[i] == 3 && buf[i+1] == 0) {
+      plen = ((unsigned int)buf[i+2] << 8) | buf[i+3];
+      if (plen < 4 || plen > rem) break;
+      if (plen >= 6) {
+        /* buf[i+4] is the X.224 LI byte; the TPDU code sits at buf[i+5] */
+        unsigned char x = buf[i+5] & 0xF0;
+        /* DT-Data: LI, 0xF0, EOT+credit, then user data at buf[i+7] */
+        if (x == 0xF0 && plen >= 8) code = 0x1000 + buf[i+7];
+        else code = x;
+      } else code = 0xFF;
+    } else if ((plen = rdp_fastpath_len(buf + i, rem, &hdrlen)) != 0) {
+      if (buf[i] & 0x80) code = 0x2FFF;  // encrypted: signature, then ciphertext
+      else if (plen > hdrlen) code = 0x2000 + (buf[i + hdrlen] & 0x0f);
+      else code = 0x2FFE;
+    } else break;
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = code;
+    i += plen;
+  }
+  *state_count_ref = state_count;
+  return state_sequence;
 }

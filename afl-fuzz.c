@@ -9058,6 +9058,39 @@ int main(int argc, char** argv) {
         } else if (!strcmp(optarg, "DNS")) {
           extract_requests = &extract_requests_dns;
           extract_response_codes = &extract_response_codes_dns;
+        } else if (!strcmp(optarg, "RDP")) {
+          extract_requests = &extract_requests_rdp;
+          extract_response_codes = &extract_response_codes_rdp;
+        } else if (!strcmp(optarg, "RADIUS")) {
+          extract_requests = &extract_requests_radius;
+          extract_response_codes = &extract_response_codes_radius;
+        } else if (!strcmp(optarg, "PGSQL")) {
+          extract_requests = &extract_requests_pgsql;
+          extract_response_codes = &extract_response_codes_pgsql;
+        } else if (!strcmp(optarg, "SNMP")) {
+          extract_requests = &extract_requests_snmp;
+          extract_response_codes = &extract_response_codes_snmp;
+        } else if (!strcmp(optarg, "BGP")) {
+          extract_requests = &extract_requests_bgp;
+          extract_response_codes = &extract_response_codes_bgp;
+        } else if (!strcmp(optarg, "HTTP2")) {
+          extract_requests = &extract_requests_http2;
+          extract_response_codes = &extract_response_codes_http2;
+        } else if (!strcmp(optarg, "IMAP")) {
+          extract_requests = &extract_requests_imap;
+          extract_response_codes = &extract_response_codes_imap;
+        } else if (!strcmp(optarg, "COAP")) {
+          extract_requests = &extract_requests_coap;
+          extract_response_codes = &extract_response_codes_coap;
+        } else if (!strcmp(optarg, "CHRONY")) {
+          extract_requests = &extract_requests_chrony;
+          extract_response_codes = &extract_response_codes_chrony;
+        } else if (!strcmp(optarg, "CHRONYC")) {
+          extract_requests = &extract_requests_chronyc;
+          extract_response_codes = &extract_response_codes_chronyc;
+        } else if (!strcmp(optarg, "MEMCACHED")) {
+          extract_requests = &extract_requests_memcached;
+          extract_response_codes = &extract_response_codes_memcached;
         } else if (!strcmp(optarg, "DICOM")) {
           extract_requests = &extract_requests_dicom;
           extract_response_codes = &extract_response_codes_dicom;
