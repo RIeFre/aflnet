@@ -45,17 +45,19 @@ int main(int argc, char* argv[])
     fprintf(stderr, "[AFLNet-replay] Error opening file %s\n", argv[1]); 
     exit(1);
   }
-  else if (!strcmp(argv[2], "RDP")) extract_response_codes = &extract_response_codes_rdp;
+
+  /* The profuzzbench-new parsers head the chain, in afl-fuzz's -P order, so
+     upstream's own SNMP branch further down stays unreachable here too. */
+  if (!strcmp(argv[2], "RDP")) extract_response_codes = &extract_response_codes_rdp;
   else if (!strcmp(argv[2], "RADIUS")) extract_response_codes = &extract_response_codes_radius;
   else if (!strcmp(argv[2], "PGSQL")) extract_response_codes = &extract_response_codes_pgsql;
   else if (!strcmp(argv[2], "SNMP")) extract_response_codes = &extract_response_codes_snmp;
   else if (!strcmp(argv[2], "BGP")) extract_response_codes = &extract_response_codes_bgp;
   else if (!strcmp(argv[2], "HTTP2")) extract_response_codes = &extract_response_codes_http2;
-  
   else if (!strcmp(argv[2], "COAP")) extract_response_codes = &extract_response_codes_coap;
   else if (!strcmp(argv[2], "CHRONY")) extract_response_codes = &extract_response_codes_chrony;
   else if (!strcmp(argv[2], "CHRONYC")) extract_response_codes = &extract_response_codes_chronyc;
-  if (!strcmp(argv[2], "RTSP")) extract_response_codes = &extract_response_codes_rtsp;
+  else if (!strcmp(argv[2], "RTSP")) extract_response_codes = &extract_response_codes_rtsp;
   else if (!strcmp(argv[2], "FTP")) extract_response_codes = &extract_response_codes_ftp;
   else if (!strcmp(argv[2], "MQTT")) extract_response_codes = &extract_response_codes_mqtt;
   else if (!strcmp(argv[2], "DNS")) extract_response_codes = &extract_response_codes_dns;
