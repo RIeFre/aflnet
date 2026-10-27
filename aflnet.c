@@ -2735,6 +2735,14 @@ region_t* convert_kl_messages_to_regions(klist_t(lms) *kl_messages, u32* region_
 
 // Network communication functions
 
+/* Upper bound for the per-exec accumulated server response (response_buf).
+ * Without it a flooding server grows the buffer toward MAX_ALLOC (1 GiB) and
+ * the next DFL_ck_realloc aborts the whole fuzzer run. 16 MiB is far above any
+ * legitimate protocol response (largest realistic flights/tables are a few
+ * hundred kB); a truncated response still yields a deterministic state
+ * sequence, so the exec is measured normally and fuzzing continues. */
+#define RESPONSE_BUF_CAP (16 * 1024 * 1024)
+
 int net_send(int sockfd, struct timeval timeout, char *mem, unsigned int len) {
   unsigned int byte_count = 0;
   int n;
@@ -2775,6 +2783,10 @@ int net_recv(int sockfd, struct timeval timeout, int poll_w, char **response_buf
         return 1;
       }
       while (n > 0) {
+        if (*len + n > RESPONSE_BUF_CAP) {
+          // Response flood: keep what we have, stop accumulating, treat as success
+          return 0;
+        }
         usleep(10);
         *response_buf = (unsigned char *)ck_realloc(*response_buf, *len + n + 1);
         memcpy(&(*response_buf)[*len], temp_buf, n);

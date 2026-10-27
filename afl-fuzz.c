@@ -5981,7 +5981,18 @@ AFLNET_REGIONS_SELECTION:;
   }
 
   u32 in_buf_size = 0;
+  //2026-10-15 graft (aflnet35 campaign): the walk below terminated the
+  //fuzzer twice (wolfssl 4.45h, wolfssl 15.5h, mbedtls 9.7h) with
+  //"Bad alloc request: 1073741828" -- 2^30+4 = (2^28+1)*4, i.e. the loop
+  //kept appending 4-byte messages past M2_next. klib lists are circular,
+  //so once the walk re-enters the list it can never equal M2_next and
+  //in_buf grows until the allocator aborts. Each queue message maps to
+  //exactly one region, so a legit walk covers at most region_count
+  //elements -- guard it and stop there. Semantics unchanged for every
+  //input that previously terminated.
+  u32 m2_walk_guard = 0;
   while (it != M2_next) {
+    if (m2_walk_guard++ >= queue_cur->region_count) break;
     in_buf = (u8 *) ck_realloc (in_buf, in_buf_size + kl_val(it)->msize);
     if (!in_buf) PFATAL("AFLNet cannot allocate memory for in_buf");
     //Retrieve data from kl_messages to populate the in_buf
