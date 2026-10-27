@@ -328,8 +328,12 @@
 #define MAP_SIZE_POW2       16
 #define MAP_SIZE            (1 << MAP_SIZE_POW2)
 
-/* Half for storing code coverage, and half for storing state coverage */
+/* With state feedback compiled in (AFLNET_STATE_MAP=1 at instrumentation
+   time), the lower SHIFT_SIZE bytes of the map hold state transitions and
+   code edges are folded into the upper half. Otherwise code coverage uses
+   the whole map, as in AFL. STATE_MAP_SIG marks split-map binaries. */
 #define SHIFT_SIZE          (1 << (MAP_SIZE_POW2 - 1))
+#define STATE_MAP_SIG       "##SIG_AFLNET_STATE_MAP##"
 
 #define STATE_SIZE_POW2     8
 #define STATE_SIZE          (1 << STATE_SIZE_POW2)

@@ -8094,6 +8094,20 @@ EXP_ST void check_binary(u8* fname) {
 
   }
 
+  /* Code + state feedback shares the map, so it needs a target whose
+     code edges were folded into the upper half (AFLNET_STATE_MAP=1). */
+
+  if (memmem(f_data, f_len, STATE_MAP_SIG, strlen(STATE_MAP_SIG) + 1)) {
+
+    OKF(cPIN "Split code/state map binary detected.");
+
+  } else if (feedback_type == CODE_STATE_FEEDBACK) {
+
+    FATAL("-b %u needs a target instrumented with AFLNET_STATE_MAP=1",
+          feedback_type);
+
+  }
+
   if (memmem(f_data, f_len, DEFER_SIG, strlen(DEFER_SIG) + 1)) {
 
     OKF(cPIN "Deferred forkserver binary detected.");

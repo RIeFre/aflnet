@@ -44,6 +44,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
 
@@ -100,6 +101,21 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   }
 
+  /* Fold code edges into the upper half of the map only when the build
+     reserves the lower half for state feedback; mark such binaries so
+     afl-fuzz can tell them apart. */
+
+  char* state_map_str = getenv("AFLNET_STATE_MAP");
+  bool state_map = state_map_str && *state_map_str && strcmp(state_map_str, "0");
+
+  if (state_map) {
+    Constant *Sig = ConstantDataArray::getString(C, STATE_MAP_SIG);
+    GlobalVariable *SigVar = new GlobalVariable(
+        M, Sig->getType(), true, GlobalValue::PrivateLinkage, Sig,
+        "__aflnet_state_map_sig");
+    appendToUsed(M, {SigVar});
+  }
+
   /* Get globals for the SHM region and the previous location. Note that
      __afl_prev_loc is thread-local. */
 
@@ -139,15 +155,14 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
       MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-      // Value *MapPtrIdx =
-      //     IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
-      /* Shift coverage feedback to the left by SHIFT_SIZE many elements
-        (PrevLocCasted XOR PrevLocCasted) -->
-        (((PrevLocCasted XOR PrevLocCasted) % (MAP_SIZE - SHIFT_SIZE)) + SHIFT_SIZE)
-      */
-      Value *MapPtrIdx =
-          IRB.CreateGEP(MapPtr,
-                        IRB.CreateAdd(IRB.CreateURem(IRB.CreateXor(PrevLocCasted, CurLoc), ConstantInt::get(Int32Ty, MAP_SIZE - SHIFT_SIZE)), ConstantInt::get(Int32Ty, SHIFT_SIZE)));
+      /* Edge index prev ^ cur; with AFLNET_STATE_MAP it is folded into the
+         upper half: (prev ^ cur) % (MAP_SIZE - SHIFT_SIZE) + SHIFT_SIZE. */
+      Value *EdgeIdx = IRB.CreateXor(PrevLocCasted, CurLoc);
+      if (state_map)
+        EdgeIdx = IRB.CreateAdd(
+            IRB.CreateURem(EdgeIdx, ConstantInt::get(Int32Ty, MAP_SIZE - SHIFT_SIZE)),
+            ConstantInt::get(Int32Ty, SHIFT_SIZE));
+      Value *MapPtrIdx = IRB.CreateGEP(MapPtr, EdgeIdx);
 
       /* Update bitmap */
 
@@ -172,10 +187,11 @@ bool AFLCoverage::runOnModule(Module &M) {
   if (!be_quiet) {
 
     if (!inst_blocks) WARNF("No instrumentation targets found.");
-    else OKF("Instrumented %u locations (%s mode, ratio %u%%).",
+    else OKF("Instrumented %u locations (%s mode, ratio %u%%, %s map).",
              inst_blocks, getenv("AFL_HARDEN") ? "hardened" :
              ((getenv("AFL_USE_ASAN") || getenv("AFL_USE_MSAN")) ?
-              "ASAN/MSAN" : "non-hardened"), inst_ratio);
+              "ASAN/MSAN" : "non-hardened"), inst_ratio,
+             state_map ? "split code/state" : "full code");
 
   }
 
