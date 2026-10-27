@@ -390,6 +390,15 @@ u8 socket_timeout = 0;
 u8 protocol_selected = 0;
 u8 terminate_child = 0;
 u8 corpus_read_or_sync = 0;
+
+/* Round 144 in-situ coverage replay (RewireFuzz workspace).
+   AFLNET_REGIONS_DIR names a previous campaign's out/regions directory: an
+   input whose file there covers it exactly keeps the message boundaries it
+   was fuzzed with instead of being re-split by the protocol parser.
+   AFLNET_REPLAY_ONLY=1 stops after the dry run. */
+static u8 *regions_dir;
+static u8 replay_only;
+static u64 regions_loaded, regions_parsed;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
@@ -1597,6 +1606,48 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 /* Append new test case to the queue. */
 
+/* Read AFLNET_REGIONS_DIR/<basename>, written by save_regions_to_file().
+   The regions must be contiguous from byte 0 and end at the last byte;
+   anything else returns NULL so the caller falls back to the parser. */
+static region_t *load_saved_regions(u8 *fname, u32 len, u32 *count_ref) {
+  if (!regions_dir) return NULL;
+  u8 *base = (u8 *)strrchr((char *)fname, '/');
+  u8 *path = alloc_printf("%s/%s", regions_dir, base ? base + 1 : fname);
+  FILE *fp = fopen((char *)path, "r");
+  ck_free(path);
+  if (!fp) return NULL;
+
+  region_t *regions = NULL;
+  u32 count = 0;
+  s32 index, start, end, next = 0;
+  u8 valid = 1;
+  while (fscanf(fp, " Region %d - Start: %d, End: %d", &index, &start,
+                &end) == 3) {
+    if (index != (s32)count || start != next || end < start ||
+        (u32)end >= len) {
+      valid = 0;
+      break;
+    }
+    regions = ck_realloc(regions, (count + 1) * sizeof(region_t));
+    regions[count].start_byte = start;
+    regions[count].end_byte = end;
+    regions[count].state_sequence = NULL;
+    regions[count].state_count = 0;
+    regions[count].modifiable = 0;
+    ++count;
+    next = end + 1;
+  }
+  if (!feof(fp)) valid = 0;
+  fclose(fp);
+
+  if (!valid || !count || (u32)next != len) {
+    ck_free(regions);
+    return NULL;
+  }
+  *count_ref = count;
+  return regions;
+}
+
 static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
@@ -1645,7 +1696,15 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     fclose(fp);
 
     if (byte_count != len) PFATAL("AFLNet - Inconsistent file length '%s'", fname);
-    q->regions = (*extract_requests)(buf, len, &q->region_count);
+    q->regions = corpus_read_or_sync == 1
+                     ? load_saved_regions(fname, len, &q->region_count)
+                     : NULL;
+    if (q->regions) {
+      ++regions_loaded;
+    } else {
+      q->regions = (*extract_requests)(buf, len, &q->region_count);
+      if (corpus_read_or_sync == 1) ++regions_parsed;
+    }
     ck_free(buf);
 
     //Keep track the maximal number of seed regions
@@ -2351,7 +2410,9 @@ static void read_testcases(void) {
 
     }
 
-    if (st.st_size > MAX_FILE)
+    /* A replay runs every queue entry the campaign saved, including the
+       few its mutations grew past the seed limit. */
+    if (st.st_size > MAX_FILE && !replay_only)
       FATAL("Test case '%s' is too big (%s, limit is %s)", fn,
             DMS(st.st_size), DMS(MAX_FILE));
 
@@ -3636,13 +3697,14 @@ static void perform_dry_run(char** argv) {
 
       case FAULT_TMOUT:
 
-        if (timeout_given) {
+        /* A replay-only run skips timeouts as if -t nn+ were given. */
+        if (timeout_given || replay_only) {
 
           /* The -t nn+ syntax in the command line sets timeout_given to '2' and
              instructs afl-fuzz to tolerate but skip queue entries that time
              out. */
 
-          if (timeout_given > 1) {
+          if (timeout_given > 1 || replay_only) {
             WARNF("Test case results in a timeout (skipping)");
             q->cal_failed = CAL_CHANCES;
             cal_failures++;
@@ -4370,6 +4432,9 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
     fprintf(f, "peak_rss_mb       : %zu\n", usage.ru_maxrss >> 10);
 #endif /* ^__APPLE__ */
   }
+  fprintf(f, "replay_only       : %u\nregions_loaded    : %llu\n"
+             "regions_parsed    : %llu\n", replay_only, regions_loaded,
+          regions_parsed);
   fprintf(f, "favored_selection : %s\n",
           aflnet_legacy_selection ? "legacy" : "state");
 
@@ -9280,6 +9345,16 @@ int main(int argc, char** argv) {
   if (getenv("AFL_NO_ARITH"))      no_arith         = 1;
   if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
   if (getenv("AFL_FAST_CAL"))      fast_cal         = 1;
+  u8 *replay_env = (u8 *)getenv("AFLNET_REPLAY_ONLY");
+  if (replay_env && *replay_env) {
+    if (strcmp((char *)replay_env, "0") && strcmp((char *)replay_env, "1"))
+      FATAL("Invalid AFLNET_REPLAY_ONLY '%s' (expected 0 or 1)", replay_env);
+    replay_only = replay_env[0] == '1';
+  }
+  regions_dir = (u8 *)getenv("AFLNET_REGIONS_DIR");
+  if (regions_dir && !*regions_dir) regions_dir = NULL;
+  if (regions_dir && access((char *)regions_dir, R_OK | X_OK))
+    PFATAL("Unable to read AFLNET_REGIONS_DIR '%s'", regions_dir);
   u8 *legacy_selection = (u8 *)getenv("AFLNET_LEGACY_SELECTION");
   aflnet_legacy_selection = legacy_selection && *legacy_selection &&
                             strcmp((char *)legacy_selection, "0");
@@ -9347,6 +9422,13 @@ int main(int argc, char** argv) {
     use_argv = argv + optind;
 
   perform_dry_run(use_argv);
+
+  if (replay_only) {
+    OKF("Replay-only run: %llu inputs kept their saved regions, %llu were "
+        "parsed.", regions_loaded, regions_parsed);
+    write_stats_file(0, 0, 0);
+    goto stop_fuzzing;
+  }
 
   cull_queue();
 
