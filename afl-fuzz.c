@@ -393,6 +393,7 @@ u8 corpus_read_or_sync = 0;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
+static u8 aflnet_legacy_selection;    /* AFLNET_LEGACY_SELECTION: original FAVOR seed selection */
 u8 feedback_type = CODE_FEEDBACK;   /* Select interesting seeds based on code feedback */
 u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machine */
 u8 code_aware_schedule = 0;
@@ -682,6 +683,21 @@ unsigned int choose_target_state(u8 mode) {
   return result;
 }
 
+/* Favored entries still pending in one state, by cull_queue()'s rule:
+   initial or generated while that state was targeted, and not yet fuzzed
+   there. */
+static u32 state_pending_favored(state_info_t *state, u32 state_id) {
+  u32 state_index = get_state_index(state_id), pending = 0, i;
+  for (i = 0; i < state->seeds_count; ++i) {
+    struct queue_entry *seed = state->seeds[i];
+    if (seed->favored &&
+        (seed->generating_state_id == state_id || seed->is_initial_seed) &&
+        was_fuzzed_map[state_index][seed->index] == 0)
+      ++pending;
+  }
+  return pending;
+}
+
 /* Select a seed to exercise the target state */
 struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 {
@@ -710,6 +726,11 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
           //Do seed selection similar to AFL + take into account state-aware information
           //e.g., was_fuzzed information becomes state-aware
           u32 passed_cycles = 0;
+          /* The global pending_favored is counted by cull_queue() for the
+             state targeted at the last score change; count this state's. */
+          u32 pending = aflnet_legacy_selection
+                            ? pending_favored
+                            : state_pending_favored(state, target_state_id);
           while (passed_cycles < 5) {
             result = state->seeds[state->selected_seed_index];
             if (state->selected_seed_index + 1 == state->seeds_count) {
@@ -722,7 +743,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
             if (result->generating_state_id != target_state_id && !result->is_initial_seed && UR(100) < 90) continue;
 
             u32 target_state_index = get_state_index(target_state_id);
-            if (pending_favored) {
+            if (pending) {
               /* If we have any favored, non-fuzzed new arrivals in the queue,
                  possibly skip to them at the expense of already-fuzzed or non-favored
                  cases. */
@@ -741,6 +762,10 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
               }
 
               /* Otherwise, this seed is selected */
+              break;
+            } else if (result->favored && !aflnet_legacy_selection) {
+              /* With nothing pending, AFL fuzzes favored entries outright;
+                 the original loop moved past them. */
               break;
             }
           }
@@ -4345,6 +4370,8 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
     fprintf(f, "peak_rss_mb       : %zu\n", usage.ru_maxrss >> 10);
 #endif /* ^__APPLE__ */
   }
+  fprintf(f, "favored_selection : %s\n",
+          aflnet_legacy_selection ? "legacy" : "state");
 
   fclose(f);
 
@@ -7628,6 +7655,13 @@ abandon_entry:
   /* Update pending_not_fuzzed count if we made it through the calibration
      cycle and have not seen this entry before. */
 
+  /* The original marked an entry fuzzed only in the state of its first
+     fuzz, so it stayed pending in every other state; mark each state it is
+     fuzzed in. */
+  if (state_aware_mode && !aflnet_legacy_selection && !stop_soon &&
+      !queue_cur->cal_failed)
+    was_fuzzed_map[get_state_index(target_state_id)][queue_cur->index] = 1;
+
   if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
     queue_cur->was_fuzzed = 1;
     was_fuzzed_map[get_state_index(target_state_id)][queue_cur->index] = 1;
@@ -9246,6 +9280,9 @@ int main(int argc, char** argv) {
   if (getenv("AFL_NO_ARITH"))      no_arith         = 1;
   if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
   if (getenv("AFL_FAST_CAL"))      fast_cal         = 1;
+  u8 *legacy_selection = (u8 *)getenv("AFLNET_LEGACY_SELECTION");
+  aflnet_legacy_selection = legacy_selection && *legacy_selection &&
+                            strcmp((char *)legacy_selection, "0");
 
   if (getenv("AFL_HANG_TMOUT")) {
     hang_tmout = atoi(getenv("AFL_HANG_TMOUT"));
